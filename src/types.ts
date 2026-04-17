@@ -40,10 +40,24 @@ export interface WatchHandle {
   close(): void;
 }
 
+/**
+ * Capability scopes that can be granted to an API key.
+ *
+ * `cron:command` — allows creating/updating cron jobs of `type: 'command'`,
+ *   which execute arbitrary shell commands on the host. This is an RCE-class
+ *   capability and must be granted explicitly (never the default).
+ */
+export type ApiKeyScope = 'cron:command';
+
 export interface ApiKey {
   key: string;
   description?: string;
   agents: string[] | '*'; // agent IDs this key can access, or '*' for all
+  /**
+   * Optional capability scopes. If omitted, the key has no elevated scopes
+   * and cannot perform privileged operations like shell-command cron jobs.
+   */
+  scopes?: ApiKeyScope[];
 }
 
 export interface ModelConfig {

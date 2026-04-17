@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { CronManager } from '../cron/manager';
 import { ApiKey, CronJobCreate, CronJobUpdate } from '../types';
-import { createApiAuthMiddleware, canAccessAgent } from './auth';
+import { createApiAuthMiddleware, canAccessAgent, hasScope } from './auth';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
@@ -36,6 +36,27 @@ export function createCronRouter(manager: CronManager, apiKeys?: ApiKey[], known
     const apiKey = (req as AuthedRequest).apiKey;
     if (!canAccessAgent(apiKey, agentId)) {
       res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Gate `type: 'command'` jobs behind the `cron:command` scope.
+   *
+   * Command jobs execute arbitrary shell on the host, which is an RCE-class
+   * capability. When auth is enabled we require an explicit scope on the key
+   * so that a compromised agent-scoped key cannot pivot to full host RCE.
+   * When auth is disabled (no apiKeys configured) we rely on the operator
+   * to keep the API off the public network.
+   */
+  function checkCommandScope(req: Request, res: Response): boolean {
+    if (!apiKeys?.length) return true;
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!hasScope(apiKey, 'cron:command')) {
+      res.status(403).json({
+        error: "API key lacks 'cron:command' scope required for type=command jobs",
+      });
       return false;
     }
     return true;
@@ -81,6 +102,8 @@ export function createCronRouter(manager: CronManager, apiKeys?: ApiKey[], known
 
     const scheduleKind = body.scheduleKind ?? 'cron';
     const type = body.type ?? 'command';
+
+    if (type === 'command' && !checkCommandScope(req, res)) return;
 
     // Schedule validation
     if (scheduleKind === 'cron' && !body.schedule) {
@@ -132,8 +155,11 @@ export function createCronRouter(manager: CronManager, apiKeys?: ApiKey[], known
       return;
     }
     if (!checkJobAccess(req, res, job.agentId)) return;
+    const update = req.body as CronJobUpdate;
+    const resultingType = update.type ?? job.type ?? 'command';
+    if (resultingType === 'command' && !checkCommandScope(req, res)) return;
     try {
-      const updated = await manager.update(req.params.id, req.body as CronJobUpdate);
+      const updated = await manager.update(req.params.id, update);
       res.json({ job: updated });
     } catch (err) {
       const message = (err as Error).message;
@@ -170,6 +196,9 @@ export function createCronRouter(manager: CronManager, apiKeys?: ApiKey[], known
       return;
     }
     if (!checkJobAccess(req, res, job.agentId)) return;
+    // Manually triggering an existing command job still spawns a shell —
+    // require the same scope as creating one.
+    if ((job.type ?? 'command') === 'command' && !checkCommandScope(req, res)) return;
     try {
       const log = await manager.run(req.params.id);
       res.json({ run: log });

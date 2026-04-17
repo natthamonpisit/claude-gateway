@@ -1,6 +1,15 @@
 import { Request, Response, NextFunction } from 'express';
-import { timingSafeEqual } from 'crypto';
-import { ApiKey } from '../types';
+import { createHash, timingSafeEqual } from 'crypto';
+import { ApiKey, ApiKeyScope } from '../types';
+
+/**
+ * Hashes a token with SHA-256 so comparison operates on fixed-length
+ * digests. This prevents length-based timing side channels that would
+ * otherwise leak how long the configured key is.
+ */
+function sha256(input: string): Buffer {
+  return createHash('sha256').update(input).digest();
+}
 
 /**
  * Express middleware that validates the Bearer token or X-Api-Key header
@@ -26,13 +35,13 @@ export function createApiAuthMiddleware(apiKeys: ApiKey[]) {
       return;
     }
 
-    const tokenBuf = Buffer.from(token);
+    // Compare SHA-256 digests so both operands are always 32 bytes.
+    // This closes the length-based timing side channel in the previous
+    // implementation, which returned early when buffer lengths differed.
+    const tokenHash = sha256(token);
     const matched = apiKeys.find((k) => {
       try {
-        const keyBuf = Buffer.from(k.key);
-        // timingSafeEqual requires same length — unequal lengths → not a match
-        if (keyBuf.length !== tokenBuf.length) return false;
-        return timingSafeEqual(keyBuf, tokenBuf);
+        return timingSafeEqual(sha256(k.key), tokenHash);
       } catch {
         return false;
       }
@@ -54,4 +63,14 @@ export function createApiAuthMiddleware(apiKeys: ApiKey[]) {
 export function canAccessAgent(apiKey: ApiKey, agentId: string): boolean {
   if (apiKey.agents === '*') return true;
   return (apiKey.agents as string[]).includes(agentId);
+}
+
+/**
+ * Returns true if the given API key has been granted the requested scope.
+ *
+ * Scopes default to the empty set — callers that protect privileged
+ * operations must fail closed when this returns false.
+ */
+export function hasScope(apiKey: ApiKey, scope: ApiKeyScope): boolean {
+  return Array.isArray(apiKey.scopes) && apiKey.scopes.includes(scope);
 }
