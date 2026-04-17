@@ -5,6 +5,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { guardedFetchText } from './url-guard';
 
 // Skill name validation: lowercase alphanumeric + hyphens, 1-64 chars
 const VALID_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -141,25 +142,12 @@ export function toRawGitHubUrl(url: string): string {
 export async function installSkill(params: InstallSkillParams): Promise<string> {
   const { url, scope, force, workspaceDir, sharedSkillsDir } = params;
 
-  // Security: only allow HTTPS
-  if (!url.startsWith('https://')) {
-    throw new Error('Only HTTPS URLs are supported for security.');
-  }
-
   const rawUrl = toRawGitHubUrl(url);
 
-  // Fetch content
-  const response = await fetch(rawUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${rawUrl}: ${response.status} ${response.statusText}`);
-  }
-
-  const content = await response.text();
-
-  // Size check
-  if (content.length > MAX_SKILL_SIZE) {
-    throw new Error(`SKILL.md exceeds ${MAX_SKILL_SIZE / 1024}KB limit (${(content.length / 1024).toFixed(1)}KB)`);
-  }
+  // SSRF-hardened fetch: enforces HTTPS, host allowlist, private-IP blocking,
+  // and manual redirect validation. See mcp/tools/skills/url-guard.ts.
+  const fetched = await guardedFetchText(rawUrl, { maxBytes: MAX_SKILL_SIZE });
+  const content = fetched.body;
 
   // Parse frontmatter to extract name
   const { extractFrontmatter } = await import('../../../src/skills/parser');
@@ -192,5 +180,5 @@ export async function installSkill(params: InstallSkillParams): Promise<string> 
 
   const description = typeof fm.description === 'string' ? fm.description : '(no description)';
 
-  return `Skill "${skillName}" installed from ${rawUrl} (scope: ${scope})\nDescription: ${description}`;
+  return `Skill "${skillName}" installed from ${fetched.url} (scope: ${scope})\nDescription: ${description}`;
 }
