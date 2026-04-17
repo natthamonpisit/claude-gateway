@@ -74,7 +74,9 @@ export class GatewayRouter {
   }
 
   private setupRoutes(): void {
-    this.app.use(express.json());
+    // Explicit request body cap (SEC-L1). Agent prompts/cron payloads are
+    // small; refuse oversize bodies to blunt memory-amplification attacks.
+    this.app.use(express.json({ limit: '64kb' }));
 
     // Mount API router after body parser so req.body is populated
     if (this.gatewayConfig?.gateway?.api?.keys?.length) {
