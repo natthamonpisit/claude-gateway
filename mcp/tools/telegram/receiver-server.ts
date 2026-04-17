@@ -249,13 +249,18 @@ function gate(ctx: Context): GateResult {
     // Cap pending at 3. Extra attempts are silently dropped.
     if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
 
-    const code = randomBytes(3).toString('hex') // 6 hex chars
+    // SEC-H2: 4 bytes = 32 bits of entropy (~4.3B codes). Paired with the
+    // 15-minute TTL and pending cap of 3 this makes brute force infeasible.
+    // Telegram user ids are always numeric; reject anything else so we can't
+    // be coaxed into writing a path-traversing senderId to disk (SEC-H1).
+    if (!/^\d+$/.test(senderId)) return { action: 'drop' }
+    const code = randomBytes(4).toString('hex') // 8 hex chars
     const now = Date.now()
     access.pending[code] = {
       senderId,
       chatId: String(ctx.chat!.id),
       createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
+      expiresAt: now + 15 * 60 * 1000, // 15 min
       replies: 1,
     }
     saveAccess(access)

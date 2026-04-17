@@ -108,6 +108,16 @@ if (entry.expiresAt < Date.now()) {
 
 // Approve pairing
 const { senderId, chatId } = entry
+
+// SEC-H1: senderId / chatId are written under approvedDir as filenames and
+// echoed to allowFrom. The receiver already rejects non-numeric senderIds
+// before creating pending entries, but defense-in-depth here guards against
+// a manually-tampered access.json used to pivot into path traversal.
+if (!/^\d+$/.test(senderId) || !/^-?\d+$/.test(chatId)) {
+  console.error(`Refusing to approve pairing: malformed senderId/chatId ("${senderId}" / "${chatId}")`)
+  process.exit(1)
+}
+
 delete access.pending[code]
 if (!access.allowFrom.includes(senderId)) {
   access.allowFrom.push(senderId)
