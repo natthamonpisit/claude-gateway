@@ -1,0 +1,27 @@
+schema: 1
+id: claude-gateway
+name: "Claude Gateway"
+status: production
+machine: core-asus
+path: ~/Project/claude-gateway
+objective: "Multi-agent gateway connecting Claude Code with Telegram"
+tech: ["Node.js", "Telegram Bot API"]
+department: core
+character: developer
+service:
+  pm2: "claude-gateway"
+functions:
+  - { id: "route", label: "ROUTE", icon: "🔀" }
+  - { id: "tg-in", label: "TG IN", icon: "📥" }
+  - { id: "tg-out", label: "TG OUT", icon: "📤" }
+  - { id: "claude", label: "CLAUDE", icon: "🤖" }
+dashboards:
+  - { id: "claude-gateway", name: "Claude Gateway", group: "automation", url: "http://100.70.110.116:3002" }
+goal: >
+  Nat chats with Claude from Telegram anywhere, sessions resumable, no silent auth loss
+for: self
+showcase: internal
+promises:
+  - id: gateway-online
+    claim: "pm2 claude-gateway online and bot responds in Telegram"
+    probe: manual (usage counter comes in P5)
