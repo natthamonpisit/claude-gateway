@@ -16,7 +16,7 @@ functions:
   - { id: "tg-out", label: "TG OUT", icon: "📤" }
   - { id: "claude", label: "CLAUDE", icon: "🤖" }
 dashboards:
-  - { id: "claude-gateway", name: "Claude Gateway", group: "automation", url: "http://100.70.110.116:3002" }
+  - { id: "claude-gateway", name: "Claude Gateway", group: "automation", url: "http://100.70.110.116:3002/health" }
 goal: >
   Nat chats with Claude from Telegram anywhere, sessions resumable, no silent auth loss
 for: self
