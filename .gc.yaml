@@ -2,6 +2,7 @@ schema: 1
 id: claude-gateway
 name: "Claude Gateway"
 status: production
+group: gateways
 machine: core-asus
 path: ~/Project/claude-gateway
 objective: "Multi-agent gateway connecting Claude Code with Telegram"
