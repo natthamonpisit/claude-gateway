@@ -788,6 +788,7 @@ export class AgentRunner extends EventEmitter {
       });
       await this.restartProcess(chatId);
 
+      this.saveSummaryToCortext(chatId, result.summaryText).catch(() => {});
       const summary = [
         `✅ Session compacted`,
         '',
@@ -795,7 +796,7 @@ export class AgentRunner extends EventEmitter {
         `After:  ${result.afterMessages} messages (~${result.afterTokens.toLocaleString()} tokens)   →  ${result.contextPctAfter}% of context`,
         `Reduced by: ${result.reductionPct}%`,
         '',
-        'Summary preserved. Full history before compaction is archived.',
+        'Summary preserved. Full history before compaction is archived. Saved to Cortex.',
       ].join('\n');
       this.writeAutoForward(chatId, summary);
     } catch (err) {
@@ -926,6 +927,21 @@ export class AgentRunner extends EventEmitter {
     }
   }
 
+  private async saveSummaryToCortext(chatId: string, summaryText: string): Promise<void> {
+    const date = new Date().toISOString().slice(0, 10);
+    const cortexUrl = 'http://localhost:8100/v2/workspaces/shared/add';
+    await fetch(cortexUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: `Jlaude session — ${date}`,
+        text: summaryText,
+        tags: ['jlaude', 'session-memory', `chat-${chatId}`],
+        source: 'jlaude',
+      }),
+    });
+  }
+
   private startIdleCleaner(): void {
     this.idleCleanerTimer = setInterval(async () => {
       for (const [id, proc] of this.sessions) {
@@ -985,7 +1001,7 @@ export class AgentRunner extends EventEmitter {
   async sendApiMessage(
     sessionId: string,
     message: string,
-    opts: { timeoutMs: number },
+    opts: { timeoutMs: number; allowTools?: boolean },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1009,11 +1025,17 @@ export class AgentRunner extends EventEmitter {
     this.pendingApiSessions.add(sessionId);
     session.touch();
 
+    // A scheduled job exists to do work; a plain API caller wants a string back.
+    const trailer = opts.allowTools
+      ? `[SYSTEM: This is a scheduled job. Use whatever tools the job needs. ` +
+        `When the work is done, end with a short plain-text summary — that text ` +
+        `is what gets delivered.]`
+      : `[SYSTEM: This is an API request. Reply with plain text only. ` +
+        `Do NOT call any tools. Your text output will be returned directly to the caller.]`;
     const channelXml =
       `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
       `${message}\n\n` +
-      `[SYSTEM: This is an API request. Reply with plain text only. ` +
-      `Do NOT call any tools. Your text output will be returned directly to the caller.]\n` +
+      `${trailer}\n` +
       `</channel>`;
 
     return new Promise<string>((resolve, reject) => {
@@ -1050,6 +1072,9 @@ export class AgentRunner extends EventEmitter {
       };
 
       const resetQuiet = () => {
+        // A tool-using job goes quiet whenever it is working, so ending the turn
+        // on silence would cut it off mid-run. Wait for the result event instead.
+        if (opts.allowTools) return;
         if (quietTimer) clearTimeout(quietTimer);
         quietTimer = setTimeout(() => done(buffer.join('')), 2000);
       };

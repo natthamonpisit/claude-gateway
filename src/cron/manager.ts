@@ -30,6 +30,8 @@ const DEFAULT_RUNS_DIR = path.join(
 
 const MAX_RUN_LOGS_PER_JOB = 100;
 const DEFAULT_TIMEOUT_MS = 120_000;
+// An agent job reads files, edits and commits — minutes, not seconds.
+const AGENT_TIMEOUT_MS = 900_000;
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
 
 interface StoreFormat {
@@ -450,9 +452,9 @@ export class CronManager extends EventEmitter {
     }
 
     const sessionId = `cron-${job.id}`;
-    const timeoutMs = job.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timeoutMs = job.timeoutMs ?? AGENT_TIMEOUT_MS;
 
-    return runner.sendApiMessage(sessionId, job.prompt!, { timeoutMs });
+    return runner.sendApiMessage(sessionId, job.prompt!, { timeoutMs, allowTools: true });
   }
 
   private async sendTelegram(agentId: string, chatId: string, text: string): Promise<void> {
