@@ -74,6 +74,18 @@ export class SessionProcess extends EventEmitter {
     return this.agentConfig.claude.model;
   }
 
+  private readProjectContext(): string {
+    try {
+      const summaryPath = path.join(os.homedir(), 'summary.md');
+      const raw = fs.readFileSync(summaryPath, 'utf-8');
+      const lines = raw.split('\n').filter(l => l.trim());
+      const snippet = lines.slice(-8).join('\n');
+      return `[Network status (~/summary.md — last entries):\n${snippet}]`;
+    } catch {
+      return '';
+    }
+  }
+
   async start(): Promise<void> {
     this.stopping = false;
     this.restartCount = 0;
@@ -143,7 +155,9 @@ export class SessionProcess extends EventEmitter {
     const messageCountAtSpawn = history.length;
 
     if (recent.length === 0) {
-      return { prompt: CHANNELS_ACTIVATION_PROMPT, loadedAtSpawn, archivedCount, messageCountAtSpawn };
+      const ctx = this.readProjectContext();
+      const prompt = ctx ? `${ctx}\n\n${CHANNELS_ACTIVATION_PROMPT}` : CHANNELS_ACTIVATION_PROMPT;
+      return { prompt, loadedAtSpawn, archivedCount, messageCountAtSpawn };
     }
 
     const historyText = recent
@@ -502,9 +516,12 @@ export class SessionProcess extends EventEmitter {
               writeStatus('tool', truncateDetail(`${toolLabel.emoji} ${taskDesc}`));
             }
           }
-          // rate_limit_event
+          // rate_limit_event — only show waiting status when actually rate-limited
           if (obj.type === 'rate_limit_event') {
-            writeStatus('waiting', '⏳ Rate limited, retrying...');
+            const info = obj.rate_limit_info as { status?: string } | undefined;
+            if (info?.status && info.status !== 'allowed') {
+              writeStatus('waiting', '⏳ Rate limited, retrying...');
+            }
           }
           // text delta (standalone, not from assistant messages)
           if (obj.type === 'text') assistantBuffer += obj.text ?? '';

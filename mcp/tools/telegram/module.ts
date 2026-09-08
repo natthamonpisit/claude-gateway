@@ -144,6 +144,33 @@ export class TelegramModule implements ChannelModule {
           required: ['chat_id', 'message_id', 'text'],
         },
       },
+      {
+        name: 'telegram_reply_keyboard',
+        description: 'Send a Telegram message with inline confirmation buttons. Use for destructive or irreversible actions that need explicit user approval. When user taps a button, its callback_data is routed back to you as a message.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            chat_id: { type: 'string' },
+            text: { type: 'string', description: 'The prompt/question to show the user.' },
+            buttons: {
+              type: 'array',
+              description: 'Rows of buttons. Each row is an array of button objects.',
+              items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string' },
+                    callback_data: { type: 'string', description: 'Data sent back when tapped. Use confirm:<action>:<token> convention.' },
+                  },
+                  required: ['text', 'callback_data'],
+                },
+              },
+            },
+          },
+          required: ['chat_id', 'text', 'buttons'],
+        },
+      },
     ];
   }
 
@@ -162,6 +189,8 @@ export class TelegramModule implements ChannelModule {
           return await this.handleDownload(args);
         case 'telegram_edit_message':
           return await this.handleEditMessage(args);
+        case 'telegram_reply_keyboard':
+          return await this.handleReplyKeyboard(args);
         default:
           return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true };
       }
@@ -429,6 +458,20 @@ export class TelegramModule implements ChannelModule {
     );
     const id = typeof edited === 'object' ? edited.message_id : args.message_id;
     return { content: [{ type: 'text', text: `edited (id: ${id})` }] };
+  }
+
+  private async handleReplyKeyboard(args: Record<string, unknown>): Promise<McpToolResult> {
+    const chat_id = args.chat_id as string;
+    const text = args.text as string;
+    const buttons = args.buttons as Array<Array<{ text: string; callback_data: string }>>;
+    this.assertAllowedChat(chat_id);
+    const inlineKeyboard = buttons.map(row =>
+      row.map(btn => ({ text: btn.text, callback_data: btn.callback_data }))
+    );
+    const sent = await this.bot.api.sendMessage(chat_id, text, {
+      reply_markup: { inline_keyboard: inlineKeyboard },
+    });
+    return { content: [{ type: 'text', text: `sent keyboard (message_id: ${sent.message_id})` }] };
   }
 
   private async startPolling(GrammyError: any): Promise<void> {

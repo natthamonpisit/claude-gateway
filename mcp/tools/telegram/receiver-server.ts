@@ -1391,6 +1391,34 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
+  // Handle confirm callbacks from telegram_reply_keyboard: confirm:<anything>
+  // Route the callback_data back to Claude as a text message so Claude can act.
+  if (data.startsWith('confirm:')) {
+    const access = loadAccess()
+    if (!access.allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const chatId = String(ctx.callbackQuery.message?.chat.id ?? ctx.from.id)
+    await ctx.answerCallbackQuery({ text: 'Got it!' }).catch(() => {})
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {})
+    if (CALLBACK_URL_BASE) {
+      fetch(CALLBACK_URL_BASE + '/channel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `[Button: ${data}]`,
+          meta: {
+            chat_id: chatId,
+            user: String(ctx.from.username ?? ctx.from.id),
+            ts: new Date().toISOString(),
+          },
+        }),
+      }).catch(() => {})
+    }
+    return
+  }
+
   // Handle permission callbacks: perm:allow|deny|more:<id>
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {

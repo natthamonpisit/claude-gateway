@@ -12,6 +12,7 @@ export interface CompactionResult {
   reductionPct: number;
   contextPctBefore: number;
   contextPctAfter: number;
+  summaryText: string;
 }
 
 export class NotEnoughMessagesError extends Error {
@@ -89,7 +90,7 @@ export class SessionCompactor {
     const contextPctBefore = Math.round((beforeTokens / contextWindow) * 100);
     const contextPctAfter = Math.round((afterTokens / contextWindow) * 100);
 
-    return { beforeMessages, afterMessages, beforeTokens, afterTokens, reductionPct, contextPctBefore, contextPctAfter };
+    return { beforeMessages, afterMessages, beforeTokens, afterTokens, reductionPct, contextPctBefore, contextPctAfter, summaryText };
   }
 
   private async summarizeWithChunking(historyText: string): Promise<string> {
