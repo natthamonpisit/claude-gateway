@@ -37,6 +37,14 @@ export class TelegramReceiver {
         TELEGRAM_BOT_TOKEN: this.agentConfig.telegram.botToken,
         TELEGRAM_STATE_DIR: stateDir,
         CLAUDE_CHANNEL_CALLBACK: `http://127.0.0.1:${this.callbackPort}/channel`,
+        TELEGRAM_AGENT_ID: this.agentConfig.id,
+        // Zero-LLM fast path (see types.ts TelegramFastPathConfig). Only set
+        // when the agent's config.json has a `fastPath` block — absent for
+        // every agent that doesn't opt in (e.g. office), so receiver-server.ts
+        // behaves exactly as before for them.
+        ...(this.agentConfig.fastPath
+          ? { TELEGRAM_FASTPATH: JSON.stringify(this.agentConfig.fastPath) }
+          : {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

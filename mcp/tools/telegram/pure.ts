@@ -222,3 +222,63 @@ export function isMentionedPure(input: GateInput, extraPatterns?: string[]): boo
   }
   return false
 }
+
+// ─── Fast path (zero-LLM command shortcuts, e.g. NOVA kernel) ────────────────
+//
+// Kept here (not receiver-server.ts) so the matcher/substitution logic can be
+// unit-tested without Grammy/MCP. The actual process-spawning lives in
+// receiver-server.ts (impure — child_process, timers).
+
+export type FastPathRule = {
+  match: string
+  args: string[]
+  reply?: boolean
+}
+
+export type FastPathConfig = {
+  command: string
+  rules: FastPathRule[]
+  timeoutMs?: number
+}
+
+export type FastPathMatch = {
+  rule: FastPathRule
+  ruleIndex: number
+  args: string[]
+}
+
+/**
+ * Substitute `$1`..`$9` in `arg` with the corresponding capture group from
+ * `m` (empty string if that group didn't participate in the match).
+ */
+export function substituteCaptures(arg: string, m: RegExpExecArray): string {
+  return arg.replace(/\$([1-9])/g, (_, d: string) => m[Number(d)] ?? '')
+}
+
+/**
+ * Match inbound DM text against an agent's fastPath rules. First rule whose
+ * `match` regex tests true against the trimmed text wins (case-insensitive).
+ * Returns undefined when no fastPath is configured or no rule matches — the
+ * caller falls through to the normal (Claude) path unchanged.
+ */
+export function matchFastPath(config: FastPathConfig | undefined, text: string): FastPathMatch | undefined {
+  if (!config || !Array.isArray(config.rules)) return undefined
+  const trimmed = text.trim()
+  for (let i = 0; i < config.rules.length; i++) {
+    const rule = config.rules[i]!
+    let re: RegExp
+    try {
+      re = new RegExp(rule.match, 'i')
+    } catch {
+      continue // malformed rule regex — skip it, keep checking later rules
+    }
+    const m = re.exec(trimmed)
+    if (!m) continue
+    return {
+      rule,
+      ruleIndex: i,
+      args: rule.args.map((a) => substituteCaptures(a, m)),
+    }
+  }
+  return undefined
+}

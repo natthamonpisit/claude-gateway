@@ -83,6 +83,38 @@ function validateAgent(agent: Record<string, unknown>, index: number): string | 
       return `agent '${agent.id}': session.maxConcurrent must be > 0`;
     }
   }
+
+  if (agent.fastPath !== undefined) {
+    if (typeof agent.fastPath !== 'object' || agent.fastPath === null) {
+      return `agent '${agent.id}': fastPath must be an object`;
+    }
+    const fastPath = agent.fastPath as Record<string, unknown>;
+    if (!fastPath.command || typeof fastPath.command !== 'string') {
+      return `agent '${agent.id}': fastPath.command must be a non-empty string`;
+    }
+    if (!Array.isArray(fastPath.rules)) {
+      return `agent '${agent.id}': fastPath.rules must be an array`;
+    }
+    for (let i = 0; i < fastPath.rules.length; i++) {
+      const rule = fastPath.rules[i];
+      if (typeof rule !== 'object' || rule === null) {
+        return `agent '${agent.id}': fastPath.rules[${i}] must be an object`;
+      }
+      const r = rule as Record<string, unknown>;
+      if (!r.match || typeof r.match !== 'string') {
+        return `agent '${agent.id}': fastPath.rules[${i}].match must be a non-empty string`;
+      }
+      if (!Array.isArray(r.args) || r.args.some((a) => typeof a !== 'string')) {
+        return `agent '${agent.id}': fastPath.rules[${i}].args must be an array of strings`;
+      }
+      if (r.reply !== undefined && typeof r.reply !== 'boolean') {
+        return `agent '${agent.id}': fastPath.rules[${i}].reply must be a boolean`;
+      }
+    }
+    if (fastPath.timeoutMs !== undefined && (typeof fastPath.timeoutMs !== 'number' || fastPath.timeoutMs <= 0)) {
+      return `agent '${agent.id}': fastPath.timeoutMs must be > 0`;
+    }
+  }
   return null;
 }
 

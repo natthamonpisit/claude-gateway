@@ -3,6 +3,32 @@ export interface SessionConfig {
   maxConcurrent?: number; // default 20
 }
 
+/**
+ * One fast-path rule: an inbound DM whose (trimmed) text matches `match`
+ * (case-insensitive regex) is handled by spawning `command` with `args`
+ * instead of starting a Claude turn. Args may contain `$1`..`$9` placeholders
+ * substituted from the rule's regex capture groups.
+ */
+export interface TelegramFastPathRule {
+  match: string;
+  args: string[];
+  /** Send the command's stdout back to the chat. Default: false (the spawned command replies itself). */
+  reply?: boolean;
+}
+
+/**
+ * Zero-LLM fast path for an agent's Telegram receiver: inbound DMs matching
+ * one of `rules` (first match wins) are handled by `command` instead of
+ * being forwarded to Claude. See src/telegram/receiver.ts and
+ * mcp/tools/telegram/receiver-server.ts for the runtime behavior.
+ */
+export interface TelegramFastPathConfig {
+  command: string;
+  rules: TelegramFastPathRule[];
+  /** Max time to wait for the command, in ms. Default: 5000. */
+  timeoutMs?: number;
+}
+
 export interface AgentConfig {
   id: string;
   description: string;
@@ -26,6 +52,8 @@ export interface AgentConfig {
   session?: SessionConfig;
   /** Agent's signature emoji (used in greetings/sign-offs) */
   signatureEmoji?: string;
+  /** Zero-LLM fast path for simple commands (see TelegramFastPathConfig). Absent = no fast path (normal behavior). */
+  fastPath?: TelegramFastPathConfig;
 }
 
 export interface AgentStats {

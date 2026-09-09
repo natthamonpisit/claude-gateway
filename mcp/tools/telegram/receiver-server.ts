@@ -28,8 +28,9 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { spawn } from 'child_process'
 import { createWorkingStateManager } from './typing'
-import { hasMarkdown, toTelegramHtml } from './pure'
+import { hasMarkdown, toTelegramHtml, matchFastPath, type FastPathConfig } from './pure'
 
 // Standalone fallback: default state dir to ~/.claude/channels/telegram
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -679,6 +680,108 @@ const CALLBACK_URL_BASE = (() => {
   }
 })()
 
+// ─── Fast path (zero-LLM command shortcuts, e.g. NOVA kernel) ────────────────
+//
+// Set only for agents whose config.json has a `fastPath` block (receiver.ts
+// injects TELEGRAM_FASTPATH). Absent for every other agent (e.g. office) —
+// FAST_PATH stays undefined and matchFastPath() always returns undefined, so
+// the normal callback path below is completely untouched for them.
+const AGENT_ID = process.env.TELEGRAM_AGENT_ID ?? 'unknown'
+const FAST_PATH: FastPathConfig | undefined = (() => {
+  const raw = process.env.TELEGRAM_FASTPATH
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw) as FastPathConfig
+  } catch (err) {
+    process.stderr.write(`telegram channel: TELEGRAM_FASTPATH is not valid JSON, fast path disabled: ${err}\n`)
+    return undefined
+  }
+})()
+const DEFAULT_FASTPATH_TIMEOUT_MS = 5_000
+
+/**
+ * Run a matched fast-path rule's command, feeding it the full inbound text
+ * on stdin. Never throws — spawn errors and timeouts are folded into a
+ * non-zero synthetic exit code so the caller always gets a definite result.
+ */
+function runFastPathCommand(
+  command: string,
+  args: string[],
+  stdin: string,
+  timeoutMs: number,
+): Promise<{ exitCode: number; stdout: string }> {
+  return new Promise((resolve) => {
+    let stdout = ''
+    let settled = false
+    let child: ReturnType<typeof spawn>
+    const finish = (exitCode: number) => {
+      if (settled) return
+      settled = true
+      resolve({ exitCode, stdout })
+    }
+    try {
+      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch {
+      finish(127) // command not found / not executable
+      return
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      finish(124) // conventional shell timeout exit code
+    }, timeoutMs)
+    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })
+    child.stderr?.on('data', () => {}) // command's own stderr isn't user-facing; nothing to log without risking message content
+    child.on('error', () => {
+      clearTimeout(timer)
+      finish(127)
+    })
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      finish(code ?? 1)
+    })
+    child.stdin?.on('error', () => {}) // e.g. EPIPE if the command exits before reading stdin
+    child.stdin?.end(stdin)
+  })
+}
+
+/**
+ * Attempt the zero-LLM fast path for an inbound DM. Returns true when the
+ * message was fully handled here (nothing more to do); false when there was
+ * no match, or the command failed and the caller should fall through to the
+ * normal Claude path (a Thai one-liner has already been sent to the chat in
+ * that case).
+ */
+async function tryFastPath(ctx: Context, chat_id: string, text: string): Promise<boolean> {
+  if (!FAST_PATH) return false
+  const match = matchFastPath(FAST_PATH, text)
+  if (!match) return false
+
+  const startedAt = Date.now()
+  const { exitCode, stdout } = await runFastPathCommand(
+    FAST_PATH.command,
+    match.args,
+    text,
+    FAST_PATH.timeoutMs ?? DEFAULT_FASTPATH_TIMEOUT_MS,
+  )
+  const durationMs = Date.now() - startedAt
+
+  // Single structured log line — agent id, rule index, exit code, duration.
+  // Never the message text.
+  process.stderr.write(
+    `telegram channel: fastpath agent=${AGENT_ID} rule=${match.ruleIndex} exit=${exitCode} ms=${durationMs}\n`,
+  )
+
+  if (exitCode === 0) {
+    if (match.rule.reply) {
+      await bot.api.sendMessage(chat_id, stdout.trim() || '(no output)').catch(() => {})
+    }
+    return true // handled — kernel replies itself, or we just sent its stdout
+  }
+
+  await ctx.reply(`สมอง Nova ไม่ตอบ (${exitCode}) — ส่งต่อให้ Claude แทน`).catch(() => {})
+  return false // fall through to the normal path
+}
+
 // ─── Message helpers (shared across all polling modes) ───────────────────────
 
 // Filenames and titles are uploader-controlled. They land inside the <channel>
@@ -739,6 +842,16 @@ async function handleInbound(
       ]).catch(() => {})
     }
     return
+  }
+
+  // Zero-LLM fast path — plain-text DMs only (the photo/document/voice/etc.
+  // handlers pass a downloadImage or attachment, which fastPath rules aren't
+  // shaped for). Runs before any Claude-turn side effects below (typing
+  // indicator, ack reaction) so a match feels instant. No-op (returns false
+  // immediately) for any agent without a fastPath configured, e.g. office.
+  if (ctx.chat?.type === 'private' && !downloadImage && !attachment) {
+    const handled = await tryFastPath(ctx, chat_id, text)
+    if (handled) return
   }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
