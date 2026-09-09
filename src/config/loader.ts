@@ -160,6 +160,25 @@ function validateAgent(agent: Record<string, unknown>, index: number): string | 
     if (!frontVoice.handoffMarker || typeof frontVoice.handoffMarker !== 'string') {
       return `agent '${agent.id}': frontVoice.handoffMarker must be a non-empty string`;
     }
+    const validTransports = ['http', 'claude-cli'];
+    if (frontVoice.transport !== undefined && (typeof frontVoice.transport !== 'string' || !validTransports.includes(frontVoice.transport))) {
+      return `agent '${agent.id}': frontVoice.transport must be one of ${validTransports.join(', ')}`;
+    }
+    const transport = (frontVoice.transport as string | undefined) ?? 'claude-cli';
+    if (transport === 'http') {
+      if (!frontVoice.baseUrl || typeof frontVoice.baseUrl !== 'string') {
+        return `agent '${agent.id}': frontVoice.baseUrl is required (non-empty string) when transport is "http"`;
+      }
+      if (!frontVoice.apiKeyFile || typeof frontVoice.apiKeyFile !== 'string') {
+        return `agent '${agent.id}': frontVoice.apiKeyFile is required (non-empty string) when transport is "http"`;
+      }
+    }
+    if (frontVoice.maxTokens !== undefined && (typeof frontVoice.maxTokens !== 'number' || frontVoice.maxTokens <= 0)) {
+      return `agent '${agent.id}': frontVoice.maxTokens must be > 0`;
+    }
+    if (frontVoice.timeoutMs !== undefined && (typeof frontVoice.timeoutMs !== 'number' || frontVoice.timeoutMs <= 0)) {
+      return `agent '${agent.id}': frontVoice.timeoutMs must be > 0`;
+    }
   }
   return null;
 }

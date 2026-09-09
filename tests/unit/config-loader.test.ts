@@ -344,4 +344,143 @@ describe('config-loader', () => {
     const config = loadConfig(configPath);
     expect(config.agents[0].ack).toEqual({ enabled: true, phrases: ['ok'] });
   });
+
+  // -------------------------------------------------------------------------
+  // Front-voice "http" transport (Nova CHARTER #40) — optional, off by
+  // default; when present, "http" requires baseUrl + apiKeyFile.
+  // -------------------------------------------------------------------------
+  function agentWithFrontVoice(frontVoice: unknown) {
+    return {
+      id: 'test',
+      description: '',
+      workspace: '/tmp',
+      env: '/tmp/.env',
+      telegram: { botToken: 'tok', allowedUsers: [], dmPolicy: 'open' },
+      claude: { model: 'claude-sonnet-4-6', dangerouslySkipPermissions: false, extraFlags: [] },
+      frontVoice,
+    };
+  }
+
+  const baseFrontVoice = {
+    enabled: true,
+    model: 'claude-haiku-4-5-20251001',
+    effort: 'low' as const,
+    statusCommand: '~/bin/nova status',
+    handoffMarker: '[งานต่อ]',
+  };
+
+  it('U-CL-FVH-01: loads a valid http-transport frontVoice config', () => {
+    const configPath = path.join(tmpDir, 'valid-fv-http.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({
+        ...baseFrontVoice,
+        model: 'glm-5-turbo',
+        transport: 'http',
+        baseUrl: 'https://api.z.ai/api/anthropic',
+        apiKeyFile: '~/.config/zai/api_key',
+        maxTokens: 300,
+        timeoutMs: 12000,
+      })],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].frontVoice).toEqual({
+      ...baseFrontVoice,
+      model: 'glm-5-turbo',
+      transport: 'http',
+      baseUrl: 'https://api.z.ai/api/anthropic',
+      apiKeyFile: '~/.config/zai/api_key',
+      maxTokens: 300,
+      timeoutMs: 12000,
+    });
+  });
+
+  it('U-CL-FVH-02: transport absent still loads (backward compatible, defaults to claude-cli at runtime)', () => {
+    const configPath = path.join(tmpDir, 'fv-no-transport.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({ ...baseFrontVoice })],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].frontVoice).toEqual(baseFrontVoice);
+    expect(config.agents[0].frontVoice?.transport).toBeUndefined();
+  });
+
+  it('U-CL-FVH-03: transport "claude-cli" explicitly does not require baseUrl/apiKeyFile', () => {
+    const configPath = path.join(tmpDir, 'fv-explicit-cli.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({ ...baseFrontVoice, transport: 'claude-cli' })],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].frontVoice?.transport).toBe('claude-cli');
+  });
+
+  it('U-CL-FVH-04: skips agent when transport is an invalid value', () => {
+    const configPath = path.join(tmpDir, 'fv-bad-transport.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({ ...baseFrontVoice, transport: 'ftp' })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
+  });
+
+  it('U-CL-FVH-05: skips agent when transport is "http" but baseUrl is missing', () => {
+    const configPath = path.join(tmpDir, 'fv-http-no-baseurl.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({ ...baseFrontVoice, transport: 'http', apiKeyFile: '~/.config/zai/api_key' })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
+  });
+
+  it('U-CL-FVH-06: skips agent when transport is "http" but apiKeyFile is missing', () => {
+    const configPath = path.join(tmpDir, 'fv-http-no-apikeyfile.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({ ...baseFrontVoice, transport: 'http', baseUrl: 'https://api.z.ai/api/anthropic' })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
+  });
+
+  it('U-CL-FVH-07: skips agent when maxTokens is not a positive number', () => {
+    const configPath = path.join(tmpDir, 'fv-bad-maxtokens.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({
+        ...baseFrontVoice,
+        transport: 'http',
+        baseUrl: 'https://api.z.ai/api/anthropic',
+        apiKeyFile: '~/.config/zai/api_key',
+        maxTokens: 0,
+      })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+  });
+
+  it('U-CL-FVH-08: skips agent when timeoutMs is not a positive number', () => {
+    const configPath = path.join(tmpDir, 'fv-bad-timeoutms.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithFrontVoice({
+        ...baseFrontVoice,
+        transport: 'http',
+        baseUrl: 'https://api.z.ai/api/anthropic',
+        apiKeyFile: '~/.config/zai/api_key',
+        timeoutMs: -1,
+      })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+  });
 });

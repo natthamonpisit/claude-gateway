@@ -58,9 +58,9 @@ export interface AckConfig {
  */
 export interface FrontVoiceConfig {
   enabled: boolean;
-  /** Model id/alias for the front-voice call, e.g. "claude-haiku-4-5-20251001". */
+  /** Model id/alias for the front-voice call, e.g. "claude-haiku-4-5-20251001" (claude-cli transport) or "glm-5-turbo" (http transport). */
   model: string;
-  /** --effort level for the front-voice call. */
+  /** --effort level for the front-voice call. Only used by the claude-cli transport. */
   effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Shell command run (with a timeout) to snapshot live status for the prompt. */
   statusCommand: string;
@@ -68,6 +68,24 @@ export interface FrontVoiceConfig {
   recentMessages?: number;
   /** Marker the front voice appends when the request needs the full session to act. */
   handoffMarker: string;
+  /**
+   * How the front-voice call is made. "http" posts straight to an
+   * Anthropic-compatible /v1/messages endpoint (no CLI startup cost —
+   * measured 3.1-3.5s vs ~10s for claude-cli, CHARTER nova #40); "claude-cli"
+   * spawns `claude -p` as before. Default: "claude-cli" (backward compatible
+   * with configs written before this option existed). When transport is
+   * "http" and the HTTP call fails/times out/comes back empty, runFrontVoice
+   * automatically falls back to the claude-cli path before giving up.
+   */
+  transport?: 'http' | 'claude-cli';
+  /** Anthropic-compatible API base URL, e.g. "https://api.z.ai/api/anthropic". Required when transport is "http". */
+  baseUrl?: string;
+  /** Path to a file holding the API key (file contents are trimmed before use); "~" expands to the home dir. Required when transport is "http". Never logged. */
+  apiKeyFile?: string;
+  /** max_tokens sent to the http transport. Default: 300. */
+  maxTokens?: number;
+  /** Request timeout for the http transport, in ms. Default: 12000. */
+  timeoutMs?: number;
 }
 
 export interface AgentConfig {
