@@ -247,4 +247,101 @@ describe('config-loader', () => {
     fs.writeFileSync(configPath, 'not { valid json');
     expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
   });
+
+  // -------------------------------------------------------------------------
+  // Ack-first config (Nova CHARTER #39) — absent by default, validated when present
+  // -------------------------------------------------------------------------
+  function agentWithAck(ack: unknown) {
+    return {
+      id: 'test',
+      description: '',
+      workspace: '/tmp',
+      env: '/tmp/.env',
+      telegram: { botToken: 'tok', allowedUsers: [], dmPolicy: 'open' },
+      claude: { model: 'claude-sonnet-4-6', dangerouslySkipPermissions: false, extraFlags: [] },
+      ack,
+    };
+  }
+
+  it('U-CL-ACK-01: loads a valid ack config', () => {
+    const configPath = path.join(tmpDir, 'valid-ack.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ enabled: true, afterMs: 3000, phrases: ['หนึ่ง', 'สอง'] })],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].ack).toEqual({ enabled: true, afterMs: 3000, phrases: ['หนึ่ง', 'สอง'] });
+  });
+
+  it('U-CL-ACK-02: absent ack is left undefined (feature off by default)', () => {
+    const configPath = path.join(tmpDir, 'no-ack.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [{
+        id: 'test',
+        description: '',
+        workspace: '/tmp',
+        env: '/tmp/.env',
+        telegram: { botToken: 'tok', allowedUsers: [], dmPolicy: 'open' },
+        claude: { model: 'claude-sonnet-4-6', dangerouslySkipPermissions: false, extraFlags: [] },
+      }],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].ack).toBeUndefined();
+  });
+
+  it('U-CL-ACK-03: skips agent when ack.enabled is missing/non-boolean', () => {
+    const configPath = path.join(tmpDir, 'ack-bad-enabled.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ afterMs: 3000, phrases: ['a'] })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
+  });
+
+  it('U-CL-ACK-04: skips agent when ack.phrases is empty', () => {
+    const configPath = path.join(tmpDir, 'ack-empty-phrases.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ enabled: true, phrases: [] })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
+  });
+
+  it('U-CL-ACK-05: skips agent when ack.phrases has a non-string entry', () => {
+    const configPath = path.join(tmpDir, 'ack-bad-phrases.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ enabled: true, phrases: ['ok', 5] })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+  });
+
+  it('U-CL-ACK-06: skips agent when ack.afterMs is not a positive number', () => {
+    const configPath = path.join(tmpDir, 'ack-bad-afterms.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ enabled: true, afterMs: 0, phrases: ['ok'] })],
+    }));
+
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+  });
+
+  it('U-CL-ACK-07: accepts ack without afterMs (runtime default applies)', () => {
+    const configPath = path.join(tmpDir, 'ack-no-afterms.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      gateway: { logDir: '/tmp', timezone: 'UTC' },
+      agents: [agentWithAck({ enabled: true, phrases: ['ok'] })],
+    }));
+
+    const config = loadConfig(configPath);
+    expect(config.agents[0].ack).toEqual({ enabled: true, phrases: ['ok'] });
+  });
 });

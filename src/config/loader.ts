@@ -115,6 +115,52 @@ function validateAgent(agent: Record<string, unknown>, index: number): string | 
       return `agent '${agent.id}': fastPath.timeoutMs must be > 0`;
     }
   }
+
+  // "Ack first, think after" (Nova CHARTER #39) — optional, off by default.
+  // See AckConfig in types.ts for the runtime behavior.
+  if (agent.ack !== undefined) {
+    if (typeof agent.ack !== 'object' || agent.ack === null) {
+      return `agent '${agent.id}': ack must be an object`;
+    }
+    const ack = agent.ack as Record<string, unknown>;
+    if (typeof ack.enabled !== 'boolean') {
+      return `agent '${agent.id}': ack.enabled must be a boolean`;
+    }
+    if (ack.afterMs !== undefined && (typeof ack.afterMs !== 'number' || ack.afterMs <= 0)) {
+      return `agent '${agent.id}': ack.afterMs must be > 0`;
+    }
+    if (!Array.isArray(ack.phrases) || ack.phrases.length === 0 || ack.phrases.some((p) => typeof p !== 'string')) {
+      return `agent '${agent.id}': ack.phrases must be a non-empty array of strings`;
+    }
+  }
+
+  // "Front voice" pre-flight gate (Nova CHARTER #40) — optional, off by default.
+  // See FrontVoiceConfig in types.ts for the runtime behavior.
+  if (agent.frontVoice !== undefined) {
+    if (typeof agent.frontVoice !== 'object' || agent.frontVoice === null) {
+      return `agent '${agent.id}': frontVoice must be an object`;
+    }
+    const frontVoice = agent.frontVoice as Record<string, unknown>;
+    if (typeof frontVoice.enabled !== 'boolean') {
+      return `agent '${agent.id}': frontVoice.enabled must be a boolean`;
+    }
+    if (!frontVoice.model || typeof frontVoice.model !== 'string') {
+      return `agent '${agent.id}': frontVoice.model must be a non-empty string`;
+    }
+    const validEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+    if (typeof frontVoice.effort !== 'string' || !validEfforts.includes(frontVoice.effort)) {
+      return `agent '${agent.id}': frontVoice.effort must be one of ${validEfforts.join(', ')}`;
+    }
+    if (!frontVoice.statusCommand || typeof frontVoice.statusCommand !== 'string') {
+      return `agent '${agent.id}': frontVoice.statusCommand must be a non-empty string`;
+    }
+    if (frontVoice.recentMessages !== undefined && (typeof frontVoice.recentMessages !== 'number' || frontVoice.recentMessages <= 0)) {
+      return `agent '${agent.id}': frontVoice.recentMessages must be > 0`;
+    }
+    if (!frontVoice.handoffMarker || typeof frontVoice.handoffMarker !== 'string') {
+      return `agent '${agent.id}': frontVoice.handoffMarker must be a non-empty string`;
+    }
+  }
   return null;
 }
 

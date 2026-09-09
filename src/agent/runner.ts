@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, ModelConfig, StreamEvent } from '../types';
+import { AckConfig, AgentConfig, FrontVoiceConfig, GatewayConfig, Logger, ModelConfig, StreamEvent } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess } from '../session/process';
 import { SessionStore } from '../session/store';
@@ -11,9 +11,14 @@ import { SessionCompactor } from '../session/compactor';
 import { TelegramReceiver } from '../telegram/receiver';
 import { hasMarkdown, toTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
+import { runFrontVoice } from './front-voice';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
+// Nova CHARTER #39 ("ตอบรับก่อน คิดทีหลัง" — reply fast first, think after):
+// default delay before the ack-first phrase fires when an agent's config
+// doesn't override it. See AckConfig in types.ts.
+const DEFAULT_ACK_AFTER_MS = 3000;
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -40,6 +45,11 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks session IDs with an in-flight API request (prevents concurrent turns)
   private readonly pendingApiSessions = new Set<string>();
+
+  // Ack-first (Nova CHARTER #39), keyed by chatId. Empty unless this agent's
+  // config has ack.enabled — see ackConfigFor() / armAck() / clearAck().
+  private readonly ackTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly ackLastPhrase = new Map<string, string>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -136,29 +146,32 @@ export class AgentRunner extends EventEmitter {
                 content,
                 ts: Date.now(),
               });
-              // Route to session process (map key = chatId, actual sessionId passed separately)
-              const session = await this.getOrSpawnSession(chatId, 'telegram', sessionId);
-              let channelXml = AgentRunner.buildChannelXml(params);
 
-              // Detect skill commands and inject skill content
-              const skillInvocation = detectSkillCommand(content, this.skillRegistry);
-              if (skillInvocation) {
-                channelXml += formatSkillContext(skillInvocation);
-                this.logger.info('Skill invoked', {
-                  skill: skillInvocation.skillKey,
-                  args: skillInvocation.args,
-                  chatId,
-                });
+              // Front voice (Nova CHARTER #40) — try the fast, tool-less
+              // pre-flight gate before ever touching the full session.
+              const frontVoiceCfg = this.frontVoiceConfig;
+              if (frontVoiceCfg) {
+                const outcome = await this.tryFrontVoice(chatId, sessionId, content, frontVoiceCfg);
+                if (outcome.status === 'handled') {
+                  // Front voice answered in full — no session ever spawned.
+                  this.writeTypingDone(chatId);
+                  return;
+                }
+                if (outcome.status === 'handoff') {
+                  // Front voice already gave Nat an ack-shaped reply, so the
+                  // ack-first timer would be redundant here — CHARTER #39's
+                  // timer stays reserved for when front voice is off/failed.
+                  await this.dispatchToSession(chatId, sessionId, params, content, {
+                    armAckTimer: false,
+                    frontVoiceNote: outcome.note,
+                  });
+                  return;
+                }
+                // outcome.status === 'fallback' — front voice failed; fall
+                // through to the normal path below so the message is never lost.
               }
 
-              session.setProcessing(true);
-              session.sendMessage(channelXml);
-              session.touch();
-              this.logger.debug('Injected channel turn into session', {
-                chatId,
-                sessionId,
-                user: meta['user'],
-              });
+              await this.dispatchToSession(chatId, sessionId, params, content, { armAckTimer: true });
             })
             .catch((err) => {
               this.logger.error('Failed to route message to session', {
@@ -456,6 +469,184 @@ export class AgentRunner extends EventEmitter {
     );
   }
 
+  /** This agent's ack config, or undefined when absent/disabled — the single gate every ack method checks. */
+  private get ackConfig(): AckConfig | undefined {
+    return this.agentConfig.ack?.enabled ? this.agentConfig.ack : undefined;
+  }
+
+  /**
+   * Start (or restart) the ack-first timer for a chat (Nova CHARTER #39: reply
+   * fast first, think after). Called right after a Telegram message is routed
+   * to the Claude session — i.e. only for turns the zero-LLM fast path did
+   * NOT short-circuit (see tryFastPath in mcp/tools/telegram/receiver-server.ts,
+   * which returns before ever POSTing to this callback server). No-op unless
+   * this agent's config has ack.enabled.
+   */
+  private armAck(chatId: string): void {
+    const cfg = this.ackConfig;
+    if (!cfg) return;
+    this.clearAck(chatId);
+    const timer = setTimeout(() => {
+      this.ackTimers.delete(chatId);
+      this.sendAck(chatId, cfg).catch((err) => {
+        this.logger.warn('Ack send failed', { chatId, error: (err as Error).message });
+      });
+    }, cfg.afterMs ?? DEFAULT_ACK_AFTER_MS);
+    this.ackTimers.set(chatId, timer);
+  }
+
+  /** Cancel a pending ack — called as soon as we know a reply is on its way (or the turn/session ended). */
+  private clearAck(chatId: string): void {
+    const timer = this.ackTimers.get(chatId);
+    if (timer) {
+      clearTimeout(timer);
+      this.ackTimers.delete(chatId);
+    }
+  }
+
+  /**
+   * Send one ack phrase straight to the Telegram Bot API, bypassing the
+   * session and its MCP reply tool entirely. This is deliberate: the ack is
+   * UI ("still here, hang on"), not something Claude said, so it must never
+   * be appended to session history — history is only written in the
+   * SessionProcess 'result' handler (assistant turns) and the /channel route
+   * above (user turns), neither of which this touches. Picks a random phrase,
+   * never repeating the previous pick for this chat.
+   */
+  private async sendAck(chatId: string, cfg: AckConfig): Promise<void> {
+    const phrases = cfg.phrases;
+    if (phrases.length === 0) return;
+    const last = this.ackLastPhrase.get(chatId);
+    const choices = phrases.length > 1 ? phrases.filter((p) => p !== last) : phrases;
+    const phrase = choices[Math.floor(Math.random() * choices.length)]!;
+    this.ackLastPhrase.set(chatId, phrase);
+    await this.postTelegramMessage(chatId, phrase);
+  }
+
+  /** Raw Telegram Bot API sendMessage — shared by the ack (above) and the front voice (below). */
+  private async postTelegramMessage(chatId: string, text: string): Promise<void> {
+    const apiRoot = process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org';
+    const res = await fetch(`${apiRoot}/bot${this.agentConfig.telegram.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!res.ok) {
+      throw new Error(`Telegram sendMessage returned HTTP ${res.status}`);
+    }
+  }
+
+  /** This agent's front-voice config, or undefined when absent/disabled. */
+  private get frontVoiceConfig(): FrontVoiceConfig | undefined {
+    return this.agentConfig.frontVoice?.enabled ? this.agentConfig.frontVoice : undefined;
+  }
+
+  /**
+   * Try the front-voice pre-flight gate (Nova CHARTER #40) for one inbound
+   * message. Bypasses the session entirely — like the ack, this never
+   * touches SessionProcess — but unlike the ack, the reply IS real content
+   * from an LLM turn, so it is recorded to session history as an assistant
+   * turn (step 3 of the CHARTER flow), just via sessionStore directly
+   * instead of via the SessionProcess 'result' handler that normally does it.
+   *
+   * Returns:
+   *  - 'handled': front voice answered in full — caller does nothing more.
+   *  - 'handoff': front voice gave a short ack and the request needs the
+   *    real session — caller must still dispatch to it.
+   *  - 'fallback': front voice is unavailable or failed — caller must
+   *    dispatch to the normal session path exactly as if front voice were
+   *    off, so a flaky front voice never loses a message.
+   */
+  private async tryFrontVoice(
+    chatId: string,
+    sessionId: string,
+    content: string,
+    cfg: FrontVoiceConfig,
+  ): Promise<{ status: 'handled' } | { status: 'handoff'; note: string } | { status: 'fallback' }> {
+    try {
+      const history = await this.sessionStore.loadTelegramSession(this.agentConfig.id, chatId, sessionId);
+      const outcome = await runFrontVoice({
+        claudeBin: process.env.CLAUDE_BIN ?? 'claude',
+        workspace: this.agentConfig.workspace,
+        cfg,
+        userText: content,
+        recentMessages: history,
+        logger: this.logger,
+      });
+
+      if (!outcome.ok) {
+        this.logger.warn('Front voice failed — falling back to normal session path', { chatId });
+        return { status: 'fallback' };
+      }
+
+      await this.postTelegramMessage(chatId, outcome.replyText);
+      await this.sessionStore.appendTelegramMessage(this.agentConfig.id, chatId, sessionId, {
+        role: 'assistant',
+        content: outcome.replyText,
+        ts: Date.now(),
+      });
+
+      return outcome.handoff ? { status: 'handoff', note: outcome.replyText } : { status: 'handled' };
+    } catch (err) {
+      this.logger.warn('Front voice threw — falling back to normal session path', {
+        chatId,
+        error: (err as Error).message,
+      });
+      return { status: 'fallback' };
+    }
+  }
+
+  /**
+   * Route one inbound message to the agent's Claude session — spawn/reuse
+   * the SessionProcess, inject the channel turn, and (unless told not to)
+   * arm the ack-first timer. Shared by the normal path and the front-voice
+   * handoff path, which differ only in whether the ack timer should arm and
+   * whether a front-voice note gets appended to the channel turn.
+   */
+  private async dispatchToSession(
+    chatId: string,
+    sessionId: string,
+    params: { content?: string; meta?: Record<string, string> },
+    content: string,
+    opts: { armAckTimer: boolean; frontVoiceNote?: string },
+  ): Promise<void> {
+    const session = await this.getOrSpawnSession(chatId, 'telegram', sessionId);
+    let channelXml = AgentRunner.buildChannelXml(params);
+
+    if (opts.frontVoiceNote) {
+      // Let the full session know the front voice already spoke, so it
+      // doesn't repeat the same ack — escaped like buildChannelXml's own
+      // <replied> text, since this note is user-influenced content too.
+      const escaped = opts.frontVoiceNote.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      channelXml += `<front_voice_note>Front voice already told Nat: ${escaped}</front_voice_note>`;
+    }
+
+    // Detect skill commands and inject skill content
+    const skillInvocation = detectSkillCommand(content, this.skillRegistry);
+    if (skillInvocation) {
+      channelXml += formatSkillContext(skillInvocation);
+      this.logger.info('Skill invoked', {
+        skill: skillInvocation.skillKey,
+        args: skillInvocation.args,
+        chatId,
+      });
+    }
+
+    session.setProcessing(true);
+    session.sendMessage(channelXml);
+    session.touch();
+    if (opts.armAckTimer) {
+      // Message just handed to Claude — start the ack-first timer (Nova
+      // CHARTER #39). No-op for every agent without ack.enabled.
+      this.armAck(chatId);
+    }
+    this.logger.debug('Injected channel turn into session', {
+      chatId,
+      sessionId,
+      user: params.meta?.['user'],
+    });
+  }
+
   private async getOrSpawnSession(
     mapKey: string,              // Map lookup key (chatId for telegram, sessionId for API)
     source: 'telegram' | 'api',
@@ -500,6 +691,7 @@ export class AgentRunner extends EventEmitter {
     if (source === 'telegram') {
       proc.once('failed', () => {
         this.writeTypingError(mapKey, 'PROCESS_FAILED');
+        this.clearAck(mapKey);
         this.sessions.delete(mapKey);
       });
       // Stop typing loop when Claude's turn truly ends.
@@ -527,12 +719,19 @@ export class AgentRunner extends EventEmitter {
               for (const block of msg!.content) {
                 if (block.type === 'tool_use' && block.name === 'mcp__telegram__reply') {
                   replyCalled = true;
+                  // Reply is on its way — cancel the ack-first timer (CHARTER #39: no
+                  // point acking after the real reply has already gone out).
+                  this.clearAck(mapKey);
                 }
               }
             }
           }
           if (obj['type'] === 'result') {
             proc.setProcessing(false);
+            // Turn is over — reply already went out (tool call above) or is
+            // about to via auto-forward just below. Either way, no ack fits
+            // anymore for this turn.
+            this.clearAck(mapKey);
             // Always forward result text — it contains the agent's completion summary.
             // If the agent also called reply tool, this summary still reaches the user.
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
@@ -589,6 +788,7 @@ export class AgentRunner extends EventEmitter {
           clearTimeout(typingDoneTimer);
           typingDoneTimer = null;
         }
+        this.clearAck(mapKey);
         this.writeTypingDone(mapKey);
       });
 
@@ -976,6 +1176,8 @@ export class AgentRunner extends EventEmitter {
     this.callbackServer?.close();
     this.callbackServer = null;
     this.receiver?.stop();
+    for (const timer of this.ackTimers.values()) clearTimeout(timer);
+    this.ackTimers.clear();
     await Promise.all([...this.sessions.values()].map((s) => s.stop()));
     this.sessions.clear();
   }

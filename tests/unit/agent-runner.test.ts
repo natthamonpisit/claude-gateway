@@ -8,6 +8,8 @@ import * as path from 'path';
 interface MockStdin {
   writable: boolean;
   write: jest.Mock;
+  end: jest.Mock;
+  on: jest.Mock;
 }
 
 interface MockChildProcess extends EventEmitter {
@@ -22,7 +24,7 @@ interface MockChildProcess extends EventEmitter {
 const allProcesses: MockChildProcess[] = [];
 
 function makeMockProcess(): MockChildProcess {
-  const stdin: MockStdin = { writable: true, write: jest.fn() };
+  const stdin: MockStdin = { writable: true, write: jest.fn(), end: jest.fn(), on: jest.fn() };
   const stdout = new EventEmitter();
   const stderr = new EventEmitter();
 
@@ -1266,5 +1268,415 @@ describe('AgentRunner — session command routing', () => {
     const spawnCountAfter = spawnMock.mock.calls.length;
     // spawn should NOT have been called for a session command
     expect(spawnCountAfter).toBe(spawnCountBefore);
+  }, 15000);
+});
+
+// ── Ack-first tests (Nova CHARTER #39: "ตอบรับก่อน คิดทีหลัง") ─────────────────
+//
+// Uses real timers with small `afterMs` values rather than jest fake timers:
+// armAck()'s setTimeout is created asynchronously deep inside the /channel
+// promise chain (after SessionStore's real fs I/O resolves), so a timer
+// created there while fake timers are active would still be a *real* one by
+// the time the chain settles — see the "typing persistence" describe block's
+// real/fake timer dance for the same underlying reason. Small real delays
+// keep these tests both correct and fast.
+describe('AgentRunner — ack-first (Nova CHARTER #39)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+  let originalFetch: typeof fetch;
+  let telegramSends: Array<{ chatId: string; text: string }>;
+
+  const ACK_PHRASES = [
+    'เดี๋ยวขอไล่เช็คก่อนนะครับอุ๊ก',
+    'กำลังดูให้อยู่ครับ แป๊บนึง',
+    'ขอเวลาเช็คสถานะแป๊บครับ',
+    'รับทราบ กำลังไล่ดูให้',
+    'ขอดูของจริงก่อนนะครับ',
+  ];
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-ack-'));
+    // Nested agents/<id>/workspace so SessionStore's agentsBaseDir resolves
+    // inside tmpDir (see AgentRunner constructor: agentsBaseDir = workspace/../..).
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    agentConfig = makeAgentConfig(workspace);
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+
+    // Intercept only outbound calls to the Telegram API — sendChannelPost's
+    // fetch to the local callback server (loopback) passes through untouched.
+    telegramSends = [];
+    originalFetch = global.fetch;
+    global.fetch = jest.fn((input: unknown, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String((input as { url?: string }).url ?? input);
+      if (url.includes('api.telegram.org')) {
+        const body = JSON.parse((init?.body as string) ?? '{}');
+        telegramSends.push({ chatId: body.chat_id, text: body.text });
+        return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      }
+      return (originalFetch as (...args: unknown[]) => Promise<Response>)(input, init);
+    }) as unknown as typeof fetch;
+  });
+
+  afterEach(async () => {
+    global.fetch = originalFetch;
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  // --------------------------------------------------------------------------
+  // U-ACK-01: ack fires after afterMs when no reply arrives
+  // --------------------------------------------------------------------------
+  it('U-ACK-01: sends ack after afterMs when no reply arrives', async () => {
+    agentConfig.ack = { enabled: true, afterMs: 80, phrases: ACK_PHRASES };
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:ack01', 'hello');
+    await new Promise(r => setTimeout(r, 350)); // spawn/routing settle + past afterMs
+
+    expect(telegramSends).toHaveLength(1);
+    expect(telegramSends[0]!.chatId).toBe('chat:ack01');
+    expect(ACK_PHRASES).toContain(telegramSends[0]!.text);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-ACK-02: no ack when the reply tool fires before afterMs
+  // --------------------------------------------------------------------------
+  it('U-ACK-02: no ack when the reply tool fires before afterMs', async () => {
+    agentConfig.ack = { enabled: true, afterMs: 400, phrases: ACK_PHRASES };
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:ack02', 'hello');
+    await new Promise(r => setTimeout(r, 150)); // let spawn/routing settle, well under afterMs
+
+    const session = getSessions(runner).get('chat:ack02')!;
+    expect(session).toBeDefined();
+    // Simulate Claude calling the reply tool — this is the same signal
+    // AgentRunner already tracks for typing-indicator bookkeeping.
+    session.emit('output', JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'mcp__telegram__reply', id: 'tool-1' }] },
+      stop_reason: null,
+    }));
+
+    await new Promise(r => setTimeout(r, 400)); // past the original afterMs deadline
+
+    expect(telegramSends).toHaveLength(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-ACK-03: random phrase never repeats consecutively
+  // --------------------------------------------------------------------------
+  it('U-ACK-03: never repeats the same phrase twice in a row', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const cfg: { enabled: boolean; afterMs: number; phrases: string[] } =
+      { enabled: true, afterMs: 50, phrases: ACK_PHRASES };
+    const runnerWithSendAck = runner as unknown as {
+      sendAck(chatId: string, cfg: { enabled: boolean; afterMs: number; phrases: string[] }): Promise<void>;
+    };
+
+    for (let i = 0; i < 40; i++) {
+      await runnerWithSendAck.sendAck('chat:ack03', cfg);
+    }
+
+    expect(telegramSends).toHaveLength(40);
+    for (let i = 1; i < telegramSends.length; i++) {
+      expect(telegramSends[i]!.text).not.toBe(telegramSends[i - 1]!.text);
+    }
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-ACK-04: disabled by default (no ack config, and explicit enabled:false)
+  // --------------------------------------------------------------------------
+  it('U-ACK-04: no config at all — no timer armed, no message sent', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig); // agentConfig.ack left undefined
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:ack04', 'hello');
+    await new Promise(r => setTimeout(r, 200));
+
+    const ackTimers = (runner as unknown as { ackTimers: Map<string, unknown> }).ackTimers;
+    expect(ackTimers.size).toBe(0);
+    expect(telegramSends).toHaveLength(0);
+  }, 15000);
+
+  it('U-ACK-04b: explicit enabled:false also stays silent', async () => {
+    agentConfig.ack = { enabled: false, afterMs: 10, phrases: ACK_PHRASES };
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:ack04b', 'hello');
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(telegramSends).toHaveLength(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-ACK-05: the ack is never written into session history (it's UI, not memory)
+  // --------------------------------------------------------------------------
+  it('U-ACK-05: ack text is never written into session history', async () => {
+    agentConfig.ack = { enabled: true, afterMs: 60, phrases: ACK_PHRASES };
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:ack05', 'a real user message');
+    await new Promise(r => setTimeout(r, 300)); // past afterMs — ack should have fired
+
+    expect(telegramSends.length).toBeGreaterThanOrEqual(1);
+
+    const chatDir = path.join(tmpDir, 'agents', 'alfred', 'sessions', 'telegram-chat:ack05');
+    expect(fs.existsSync(chatDir)).toBe(true);
+    const files = fs.readdirSync(chatDir).filter(f => f.endsWith('.json') && f !== 'index.json');
+    expect(files.length).toBeGreaterThan(0);
+    const content = files.map(f => fs.readFileSync(path.join(chatDir, f), 'utf8')).join('\n');
+
+    // Sanity check: history recording itself works (the user turn landed).
+    expect(content).toContain('a real user message');
+    // The actual assertion: none of the ack phrases we saw sent ever made it into history.
+    for (const phrase of telegramSends.map(s => s.text)) {
+      expect(content).not.toContain(phrase);
+    }
+  }, 15000);
+});
+
+// ── Front-voice tests (Nova CHARTER #40: "gate แรกให้ตรงเข้า LLM ก่อนเลย") ─────
+//
+// Front voice runs two sequential child_process.spawn calls before ever
+// touching the session (status command, then `claude -p`), both through the
+// same mocked spawn() as everything else in this file — so allProcesses[0]
+// is always the status command and allProcesses[1] is always the front-voice
+// claude call, in that order, for any single message. Neither auto-resolves
+// (the mock doesn't simulate real process behavior), so each test drives
+// them to completion itself via the resolve* helpers below, polling with
+// waitFor() (real timers — see the "ack-first" block above for why fake
+// timers don't work for timers created deep inside the /channel promise chain).
+describe('AgentRunner — front voice (Nova CHARTER #40)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+  let originalFetch: typeof fetch;
+  let telegramSends: Array<{ chatId: string; text: string }>;
+
+  async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('waitFor: condition not met within timeout');
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-fv-'));
+    const workspace = path.join(tmpDir, 'agents', 'nova', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    agentConfig = makeAgentConfig(workspace, { id: 'nova' });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+
+    telegramSends = [];
+    originalFetch = global.fetch;
+    global.fetch = jest.fn((input: unknown, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : String((input as { url?: string }).url ?? input);
+      if (url.includes('api.telegram.org')) {
+        const body = JSON.parse((init?.body as string) ?? '{}');
+        telegramSends.push({ chatId: body.chat_id, text: body.text });
+        return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      }
+      return (originalFetch as (...args: unknown[]) => Promise<Response>)(input, init);
+    }) as unknown as typeof fetch;
+  });
+
+  afterEach(async () => {
+    global.fetch = originalFetch;
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  function frontVoiceCfg(): {
+    enabled: boolean;
+    model: string;
+    effort: 'low';
+    statusCommand: string;
+    recentMessages: number;
+    handoffMarker: string;
+  } {
+    return {
+      enabled: true,
+      model: 'claude-haiku-4-5-20251001',
+      effort: 'low',
+      statusCommand: '~/bin/nova status',
+      recentMessages: 8,
+      handoffMarker: '[งานต่อ]',
+    };
+  }
+
+  // AgentRunner.start() itself spawns the TelegramReceiver (a bun process)
+  // through the same mocked child_process.spawn, so allProcesses already has
+  // one entry by the time a message is sent. `startFrontVoiceCursor()` marks
+  // that baseline right after start() so nextProc() below only ever hands
+  // out the front-voice-related processes (status command, then claude -p),
+  // in order, regardless of what else spawned first.
+  let procCursor = 0;
+  function startFrontVoiceCursor(): void {
+    procCursor = allProcesses.length;
+  }
+  async function nextProc(): Promise<MockChildProcess> {
+    await waitFor(() => allProcesses.length > procCursor);
+    return allProcesses[procCursor++]!;
+  }
+
+  /** Drive the next front-voice mock process (status command, then claude -p, in call order) to a result. */
+  async function resolveNext(text: string, exitCode = 0): Promise<MockChildProcess> {
+    const proc = await nextProc();
+    if (text) proc.stdout!.emit('data', Buffer.from(text));
+    proc.emit('exit', exitCode);
+    return proc;
+  }
+
+  // --------------------------------------------------------------------------
+  // U-FV-01: front voice replies without ever touching the session process
+  // --------------------------------------------------------------------------
+  it('U-FV-01: front voice replies directly without ever touching the session process', async () => {
+    agentConfig.frontVoice = frontVoiceCfg();
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const baseline = allProcesses.length;
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv01', 'สวัสดีครับ');
+    await resolveNext('nova: ok'); // status command
+    await resolveNext('สวัสดีครับ Nat มีอะไรให้ช่วยครับ'); // front-voice claude -p
+
+    await waitFor(() => telegramSends.length >= 1);
+    expect(telegramSends[0]!.chatId).toBe('chat:fv01');
+    expect(telegramSends[0]!.text).toBe('สวัสดีครับ Nat มีอะไรให้ช่วยครับ');
+    expect(getSessions(runner).size).toBe(0);
+    expect(allProcesses.length - baseline).toBe(2); // status + front-voice claude only — no session spawn
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-FV-02: no handoff marker → no Sonnet spawn
+  // --------------------------------------------------------------------------
+  it('U-FV-02: no handoff marker means no Sonnet session spawns', async () => {
+    agentConfig.frontVoice = frontVoiceCfg();
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const baseline = allProcesses.length;
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv02', 'วันนี้วันอะไร');
+    await resolveNext('ok');
+    await resolveNext('วันนี้วันพุธครับ');
+
+    await waitFor(() => telegramSends.length >= 1);
+    await new Promise((r) => setTimeout(r, 100)); // give any accidental spawn a chance to appear
+    expect(getSessions(runner).size).toBe(0);
+    expect(allProcesses.length - baseline).toBe(2);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-FV-03: handoff marker triggers the Sonnet session path exactly once
+  // --------------------------------------------------------------------------
+  it('U-FV-03: handoff marker triggers the Sonnet session path exactly once', async () => {
+    agentConfig.frontVoice = frontVoiceCfg();
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const baseline = allProcesses.length;
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv03', 'ช่วยรีสตาร์ท nova ให้หน่อย');
+    await resolveNext('ok');
+    await resolveNext('เดี๋ยวจัดการให้ครับ [งานต่อ] รีสตาร์ท nova service');
+
+    // Front voice's own reply reaches Nat first...
+    await waitFor(() => telegramSends.length >= 1);
+    expect(telegramSends[0]!.text.trim()).toBe('เดี๋ยวจัดการให้ครับ');
+    // ...and the Sonnet session gets spawned exactly once to actually do it.
+    await waitFor(() => getSessions(runner).size === 1);
+    await waitFor(() => allProcesses.length - baseline >= 3);
+    await new Promise((r) => setTimeout(r, 100)); // give a stray second spawn a chance to appear
+    expect(allProcesses.length - baseline).toBe(3); // status + front-voice claude + exactly one session spawn
+    expect(getSessions(runner).get('chat:fv03')).toBeDefined();
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-FV-04: status command failure still answers, using "ไม่ทราบ" in the prompt
+  // --------------------------------------------------------------------------
+  it('U-FV-04: status command failure still answers, using "ไม่ทราบ" in the prompt', async () => {
+    agentConfig.frontVoice = frontVoiceCfg();
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv04', 'สถานะเป็นไง');
+    await resolveNext('', 1); // status command fails: non-zero exit, no output
+    const claudeProc = await nextProc();
+    claudeProc.stdout!.emit('data', Buffer.from('ตอนนี้เช็คสถานะไม่ได้ครับ'));
+    claudeProc.emit('exit', 0);
+
+    await waitFor(() => telegramSends.length >= 1);
+    const promptSent = claudeProc.stdin!.end.mock.calls[0]![0] as string;
+    expect(promptSent).toContain('ไม่ทราบ');
+    expect(telegramSends[0]!.text).toBe('ตอนนี้เช็คสถานะไม่ได้ครับ');
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-FV-05: disabled config = old behavior (no front-voice spawns at all)
+  // --------------------------------------------------------------------------
+  it('U-FV-05: disabled front voice keeps the old behavior (session spawns immediately)', async () => {
+    // agentConfig.frontVoice left undefined
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const baseline = allProcesses.length;
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv05', 'hello');
+    await waitFor(() => getSessions(runner).size === 1);
+
+    expect(allProcesses.length - baseline).toBe(1); // straight to the session — no status/claude-print calls
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-FV-06: front-voice claude failure falls back to the normal path (message never lost)
+  // --------------------------------------------------------------------------
+  it('U-FV-06: front-voice claude failure falls back to the normal session path', async () => {
+    agentConfig.frontVoice = frontVoiceCfg();
+    agentConfig.ack = { enabled: true, afterMs: 5000, phrases: ['กำลังดูให้'] };
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    startFrontVoiceCursor();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:fv06', 'hello');
+    await resolveNext('ok');
+    await resolveNext('', 1); // front-voice claude call itself fails
+
+    await waitFor(() => getSessions(runner).size === 1);
+    expect(telegramSends).toHaveLength(0); // no garbled reply from the failed call
+    const ackTimers = (runner as unknown as { ackTimers: Map<string, unknown> }).ackTimers;
+    expect(ackTimers.has('chat:fv06')).toBe(true); // fallback still arms the ack timer, exactly like front voice being off
   }, 15000);
 });

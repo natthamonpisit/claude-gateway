@@ -29,6 +29,47 @@ export interface TelegramFastPathConfig {
   timeoutMs?: number;
 }
 
+/**
+ * "Ack first, think after" (Nova CHARTER #39). When a Telegram message is
+ * routed to the Claude session (i.e. not resolved by the zero-LLM fast path
+ * above) and no reply has gone out within `afterMs`, AgentRunner sends one
+ * short phrase from `phrases` so the user knows the agent is on it before
+ * Claude finishes thinking. Config-driven and off by default — only agents
+ * that opt in with `enabled: true` pay for the timer. See src/agent/runner.ts.
+ */
+export interface AckConfig {
+  enabled: boolean;
+  /** Delay before sending the ack if no reply has gone out yet, in ms. Default: 3000. */
+  afterMs?: number;
+  /** Acknowledgement phrases; one is picked at random, never the same as the previous pick for that chat. */
+  phrases: string[];
+}
+
+/**
+ * "Front voice" (Nova CHARTER #40 — "gate แรกให้ตรงเข้า LLM ก่อนเลย"). Before
+ * routing a non-fast-path message to the full Claude session, AgentRunner
+ * spawns a fresh, tool-less, low-effort `claude -p` call (no --resume) that
+ * answers directly using a compact prompt: the agent's persona, a live
+ * status snapshot, a MEMORY.md excerpt, and recent chat context. If the
+ * request needs real tool use, this fast reply ends with `handoffMarker`
+ * and AgentRunner hands off to the normal (Sonnet) session path — otherwise
+ * the fast reply is the whole answer and no session ever spawns. See
+ * src/agent/front-voice.ts and src/agent/runner.ts.
+ */
+export interface FrontVoiceConfig {
+  enabled: boolean;
+  /** Model id/alias for the front-voice call, e.g. "claude-haiku-4-5-20251001". */
+  model: string;
+  /** --effort level for the front-voice call. */
+  effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  /** Shell command run (with a timeout) to snapshot live status for the prompt. */
+  statusCommand: string;
+  /** How many of the most recent session messages to include as context. Default: 8. */
+  recentMessages?: number;
+  /** Marker the front voice appends when the request needs the full session to act. */
+  handoffMarker: string;
+}
+
 export interface AgentConfig {
   id: string;
   description: string;
@@ -54,6 +95,10 @@ export interface AgentConfig {
   signatureEmoji?: string;
   /** Zero-LLM fast path for simple commands (see TelegramFastPathConfig). Absent = no fast path (normal behavior). */
   fastPath?: TelegramFastPathConfig;
+  /** "Ack first, think after" (see AckConfig). Absent or enabled:false = no ack (normal behavior). */
+  ack?: AckConfig;
+  /** "Front voice" pre-flight gate (see FrontVoiceConfig). Absent or enabled:false = no front voice (normal behavior). */
+  frontVoice?: FrontVoiceConfig;
 }
 
 export interface AgentStats {
